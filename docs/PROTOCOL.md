@@ -3,150 +3,109 @@
 The ESP32 is a **bridge with no sensors of its own**. It sits between:
 
 ```
-                 MQTT (JSON)                        SPI (32-byte frames)
+                 MQTT (JSON)                        SPI (3-byte exchange)
   [ Backend ] <===============> [ ESP32 firmware ] <====================> [ STM Nucleo ]
-      |         Mosquitto                                                  sensors, servo,
-      v         tcp://host:1883                                           breaker, gate
+      |         Mosquitto                                                  ADC water sensor,
+      v         tcp://host:1883                                           servos, 7-seg, LCD
   Spring Boot + Postgres/H2
   STOMP/WebSocket to the app, FCM
 ```
 
-There are two contracts here:
+Two contracts:
 
-1. **MQTT** — topic + flat JSON between the firmware and the WellHouse backend.
-   This matches the backend's `docs/API.md` §5 exactly.
-2. **SPI frame** — fixed 32-byte frames between the firmware (master) and the STM
-   (slave). Your STM firmware implements the slave side.
+1. **MQTT** — topic + flat JSON between the firmware and the backend (matches the
+   backend `docs/API.md` §5).
+2. **STM link** — a fixed **3-byte SPI exchange** that matches the STM firmware's
+   `main.c` as it stands (ESP32 = master, STM = slave).
 
-Both SPI peers are **little-endian** (ESP32 + STM32), so packed structs are
-exchanged without byte swapping.
+> **Why only 3 bytes?** The STM firmware ([dsm-team-11/wellHouse_firmware](https://github.com/dsm-team-11/wellHouse_firmware))
+> was written around a 3-byte exchange, so the ESP32 was adapted to it. This is
+> simpler but **cannot carry per-target commands, real ACKs, or STM error/power
+> reports** — see §2c. A richer 32-byte framed protocol (SOF+CRC+typing) is the
+> better long-term option if the STM side can be updated.
 
 ---
 
 ## 1. MQTT (firmware ⇄ backend)
 
-- Broker: Mosquitto, `mqtt://<host>:1883` (dev is anonymous; prod should use
-  auth/TLS). `mqtts://<host>:8883` uses the ESP-IDF CA bundle.
-- MQTT client id = `deviceId`. For an authenticated broker: username = `deviceId`,
-  password = the `deviceToken` from pairing.
-- All payloads are flat JSON. The **message type is the topic**, not a field.
-  Timestamps are epoch **milliseconds**. QoS 1.
+- Broker: Mosquitto, `mqtt://<host>:1883` (dev anonymous). `mqtts://` uses the CA bundle.
+- MQTT client id = `deviceId`. Payloads are flat JSON; timestamps are epoch **ms**; QoS 1.
 
 ### 1a. Publish (firmware → backend)
 
-| Topic | Payload |
-|-------|---------|
-| `devices/{id}/water` | `{ "level_cm": 5.2, "timestamp": 1699999999999 }` |
-| `devices/{id}/heartbeat` | `{ "rssi": -60, "timestamp": ... }` (every 30 s) |
-| `devices/{id}/power` | `{ "powerState": "on"\|"cutoff", "source": "auto"\|"manual", "timestamp": ... }` |
-| `devices/{id}/commands/{cmdId}/ack` | `{ "result": "ok"\|"fail", "detail": "..." }` |
-
-- `level_cm` is a **decimal** (the firmware derives it from the STM's millimetre
-  reading: `level_cm = level_mm / 10`).
-- `{cmdId}` in the ack topic is the backend's UUID, echoed from the command.
-- Heartbeats are **never** buffered offline; a stale liveness ping has no value.
+| Topic | Payload | Notes |
+|-------|---------|-------|
+| `devices/{id}/water` | `{ "level_cm": 5.2, "timestamp": ... }` | from STM ADC via calibration; throttled |
+| `devices/{id}/heartbeat` | `{ "rssi": -60, "timestamp": ... }` | every 30 s |
+| `devices/{id}/power` | `{ "powerState":"cutoff", "source":"auto", "timestamp": ... }` | **synthesised** on DANGER entry |
+| `devices/{id}/commands/{cmdId}/ack` | `{ "result":"ok", "detail":"forced" }` | **best-effort** (no real device ACK) |
 
 ### 1b. Subscribe (backend → firmware)
 
 | Topic | Payload |
 |-------|---------|
 | `devices/{id}/commands` | `{ cmdId, target, ts, issuedBy, reason }` |
-| `devices/{id}/control/wakeup` | `{ command:"wakeup", rainfall_mm_h, region, timestamp }` |
+| `devices/{id}/control/wakeup` | `{ command, rainfall_mm_h, region, timestamp }` |
 
-- `target` ∈ `POWER` \| `WINDOW` \| `WATER_GATE` \| `WAKEUP` (the backend
-  `CommandTarget` enum). There is **no** cutoff/restore field — the target alone
-  defines the action, and the STM decides how to actuate it.
-- The firmware must ACK each command within **10 s** (backend `ACK_TIMEOUT`), by
-  publishing to `devices/{id}/commands/{cmdId}/ack`. If the STM stays silent, the
-  firmware self-publishes `{ "result":"fail", "detail":"timeout" }`.
-- `control/wakeup` is a weather-driven hint (power-save wake). The firmware logs
-  it and forwards it to the STM; no ACK.
-
-Example round-trip:
-
-```
-backend →  devices/demo-device-01/commands
-           { "cmdId":"7f3e...","target":"POWER","ts":1699999999999,"issuedBy":"uid_42","reason":"EMERGENCY" }
-firmware → devices/demo-device-01/commands/7f3e.../ack
-           { "result":"ok","detail":"d=0" }
-```
-
-### 1c. REST fallback (not implemented in this firmware)
-
-The backend also exposes `POST /api/firmware/{id}/water|heartbeat|commands/{cmdId}/ack`
-with a `Bearer <deviceToken>`. This firmware uses MQTT only; the REST path is a
-documented fallback if you need it later.
+- `target` ∈ `POWER`/`WINDOW`/`WATER_GATE`/`WAKEUP`. Over the 3-byte link the ESP32
+  cannot address a single actuator, so **any of POWER/WINDOW/WATER_GATE forces the
+  STM to DANGER** for `CMD_HOLD_MS` (the STM then runs its all-servo `Emergency_Action`).
+  `WAKEUP` is a no-op here.
+- The ACK is published immediately as `ok` (`detail:"forced"`/`"noop"`) because the STM
+  returns no result. Treat backend ACKs as "delivered", not "confirmed executed".
+- `control/wakeup` is logged only (no STM channel).
 
 ---
 
-## 2. SPI frame (ESP32 master ⇄ STM slave)
+## 2. STM link (3-byte SPI, ESP32 master ⇄ STM slave)
 
-- ESP32 is **master**; STM is **slave**.
-- **DataReady** GPIO: STM → ESP32, **active high**. STM asserts it while it has one
-  or more frames queued. The ESP32 also polls every 200 ms as a safety net.
-- Each transaction exchanges exactly one 32-byte frame in each direction (full
-  duplex). If either side has nothing to send, it sends a `NOP` frame.
+- ESP32 is **master**; STM is **slave** (`SPI_MODE_SLAVE`, Mode 0, 8-bit, HW NSS).
+- Wiring: ESP32 SCLK→STM PB13, ESP32 MOSI→STM PB15, ESP32 MISO←STM PB14, ESP32 CS→STM PB12 (NSS).
+- The ESP32 clocks one 3-byte transaction every `SPI_POLL_MS` (default 100 ms). No CRC,
+  no framing, no DataReady line.
 
-### 2a. Frame layout (32 bytes)
+### 2a. The exchange
 
 ```
-offset size field
-0      1    sof     = 0xA5
-1      1    type    (see table)
-2      1    seq     rolling sequence (debug / dup detection)
-3      1    flags   reserved, 0
-4      26   payload (type-specific, see below)
-30     2    crc16   CRC16-CCITT (poly 0x1021, init 0xFFFF) over bytes [0..29]
+ESP32 -> STM (MOSI):  [ state, hour, minute ]
+STM -> ESP32 (MISO):  [ 0xAA,  water_hi, water_lo ]
 ```
 
-The C definition is `spi_frame_t` in [`components/proto/include/proto.h`](../components/proto/include/proto.h).
+| Field | Meaning |
+|-------|---------|
+| `state` | risk 0=SAFE 1=WARNING 2=ALERT 3=DANGER. STM shows it on the LCD and, at ≥ALERT, runs `Emergency_Action` (breaker/gas/window servos). |
+| `hour`,`minute` | wall clock (local time) for the STM 7-segment display. |
+| `0xAA` | sync byte; the ESP32 ignores the reading if byte 0 ≠ 0xAA. |
+| `water_hi`,`water_lo` | 12-bit raw ADC (0..4095), big-endian. |
 
-### 2b. Message types
+### 2b. ESP32-side processing
 
-| type   | value | direction     | payload |
-|--------|-------|---------------|---------|
-| NOP    | 0x00  | either         | *(ignored)* |
-| WATER  | 0x10  | STM → ESP32    | `uint16 level_mm` (millimetres) |
-| POWER  | 0x11  | STM → ESP32    | `uint8 state (0=on,1=cutoff)`, `uint8 source (0=auto,1=manual)` |
-| CMD_RESULT | 0x12 | STM → ESP32 | `uint16 local_cmd_id`, `uint8 result (0=ok,1=fail)`, `uint8 detail` |
-| ERROR  | 0x13  | STM → ESP32    | `uint16 code`, `char detail[24]` |
-| COMMAND | 0x20 | ESP32 → STM    | `uint16 local_cmd_id`, `uint8 target (0=POWER,1=WINDOW,2=WATER_GATE,3=WAKEUP)` |
-| TIME_SYNC | 0x21 | ESP32 → STM  | `int64 epoch_ms` |
-| WAKEUP | 0x22  | ESP32 → STM    | `uint16 rainfall_mm_h` (no ACK) |
+- **water**: `level_cm = (adc - ADC_ZERO) / ADC_PER_CM` (clamped ≥0), published (throttled).
+- **state**: judged locally from raw ADC — `≥THR_DANGER→3`, `≥THR_ALERT→2`,
+  `≥THR_WARNING→1`, else `0`. A backend command escalates it to `3` for `CMD_HOLD_MS`.
+- **clock**: `hour:minute` from the SNTP-synced clock + `UTC_OFFSET_MIN`.
 
-- **WATER is in millimetres.** The firmware converts to `level_cm` (÷10) for MQTT,
-  preserving one decimal. If you need finer resolution, widen this field and adjust
-  the conversion in `app_core.c`.
+### 2c. What this link cannot do (by design)
 
-### 2c. Command / ACK correlation
+- No per-target actuation (POWER vs WINDOW vs WATER_GATE) — only a single state byte.
+- No real command ACK — the STM sends no result; ACKs are best-effort `ok`.
+- No STM-originated power state or error reports — power is synthesised, errors are absent.
 
-The MQTT `cmdId` is a UUID string; SPI frames carry a small `local_cmd_id` (uint16).
-The ESP32 keeps the mapping:
+If these matter, move to a framed protocol: give the STM a DataReady output, a
+DMA/interrupt-driven always-ready slave, and 32-byte typed+CRC frames.
 
-1. Backend → `command{cmdId:"7f3e...", target:"POWER"}`.
-2. ESP32 allocates `local_cmd_id`, stores `local_cmd_id ↔ "7f3e..."`, sends
-   `COMMAND{local_cmd_id, target}` to the STM.
-3. STM actuates, then replies `CMD_RESULT{local_cmd_id, result, detail}`.
-4. ESP32 looks up `"7f3e..."`, publishes `ack{result, detail:"d=<detail>"}`.
+### 2d. Timing caveat
 
-The STM must **echo `local_cmd_id` unchanged** in `CMD_RESULT`. If no result arrives
-within the ACK timeout, the ESP32 fails the ACK itself.
-
-### 2d. STM slave checklist
-
-- On every SPI transaction, clock out one 32-byte frame (NOP if nothing to report).
-- Assert DataReady while ≥1 frame is queued; deassert when the queue is empty.
-- Validate `sof` and `crc16` on received frames; ignore invalid ones.
-- Handle `COMMAND`, `TIME_SYNC`, `WAKEUP`; reply to each `COMMAND` with a `CMD_RESULT`.
-- Emit `WATER` per your upload-rate rule, `POWER` on breaker state change, `ERROR`
-  on faults.
+The STM currently services SPI with a **blocking** `HAL_SPI_TransmitReceive(...,50ms)`
+inside a ~200 ms loop, so it is only listening part of the time. Keep `SPI_POLL_MS`
+short so some transactions land in that window. For reliability the STM should switch
+to `..._DMA`/`..._IT` and re-arm in the complete callback.
 
 ---
 
 ## 3. Offline behaviour
 
-While the broker is unreachable, uplink events (`water`, `power`, command `ack`) are
-stored in NVS as `topic\npayload` with their original `timestamp`, up to
-`CONFIG_WELLHOUSE_EVENT_QUEUE_CAP` entries (oldest dropped when full). On reconnect
-the firmware flushes them oldest-first. `heartbeat` is never queued. STM `ERROR`
-frames are logged locally only — the backend has no error topic.
+While the broker is unreachable, uplink events (`water`, `power`, `ack`) are stored in
+NVS as `topic\npayload` with their original `timestamp`, up to
+`CONFIG_WELLHOUSE_EVENT_QUEUE_CAP` entries (oldest dropped when full), and flushed
+oldest-first on reconnect. `heartbeat` is never queued.

@@ -4,54 +4,54 @@
 # WellHouse ESP32 Firmware
 
 ESP-IDF **5.3.1** firmware for the WellHouse flood-safety device. The ESP32 has
-**no sensors of its own** — it is a bridge that relays data between the WellHouse
-backend over **MQTT** and an **STM Nucleo** board over SPI.
+**no sensors of its own** — it bridges the WellHouse backend (over **MQTT**) and an
+**STM Nucleo** board (over a 3-byte **SPI** exchange).
 
 ```
-                 MQTT (JSON)                        SPI (32-byte frames)
+                 MQTT (JSON)                        SPI (3-byte exchange)
   [ Backend ] <===============> [ ESP32 firmware ] <====================> [ STM Nucleo ]
-      |         Mosquitto                                                  sensors, servo,
-      v         tcp://host:1883                                           breaker, gate
+      |         Mosquitto                                                  ADC water sensor,
+      v         tcp://host:1883                                           servos, 7-seg, LCD
   Spring Boot + Postgres/H2
   STOMP/WebSocket to the app, FCM
 ```
 
-- **North side (MQTT):** flat JSON on `devices/{id}/...` topics to the backend's
-  Mosquitto broker. Matches the backend contract in its `docs/API.md` §5.
-- **South side (SPI):** the ESP32 is **master**; the STM asserts a **DataReady**
-  line when it has data. Fixed 32-byte, CRC-checked frames.
+- **North side (MQTT):** flat JSON on `devices/{id}/...` topics to the backend
+  ([dsm-team-11/wellHouse-backend](https://github.com/dsm-team-11/wellHouse-backend)).
+- **South side (SPI):** ESP32 is master. Each poll it sends `[state, hour, minute]`
+  and reads `[0xAA, waterHi, waterLo]` — matching the STM firmware
+  ([dsm-team-11/wellHouse_firmware](https://github.com/dsm-team-11/wellHouse_firmware)) as-is.
 
-Backend: [dsm-team-11/wellHouse-backend](https://github.com/dsm-team-11/wellHouse-backend)
-(Spring Boot 3 / Java 17). The full wire contract for both sides is in
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md). Implement your STM firmware against it.
+Full wire contract: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+> ⚠️ The 3-byte STM link is deliberately minimal. It carries water level, a risk-state
+> byte, and a clock — but **not** per-target commands, real ACKs, or STM error/power
+> reports. See "Known limitations" below.
 
 ## What the firmware does
 
-| Backend contract | Firmware behaviour |
+| Function | Behaviour |
 | --- | --- |
-| `devices/{id}/heartbeat` | Publishes `{rssi, timestamp}` every 30 s. |
-| `devices/{id}/water` | Forwards STM `WATER` frames as `{level_cm, timestamp}`. |
-| `devices/{id}/power` | Forwards STM `POWER` frames as `{powerState, source, timestamp}`. |
-| `devices/{id}/commands` (sub) | Receives command, forwards `target` to STM. |
-| `devices/{id}/commands/{cmdId}/ack` | Maps STM `CMD_RESULT` back to the UUID; 10 s timeout → fail. |
-| `devices/{id}/control/wakeup` (sub) | Logs and forwards a wakeup hint to the STM. |
-| offline | Buffers uplink events in NVS, flushes on reconnect (timestamps kept). |
-
-Risk-stage / golden-time / FCM / reports logic stays in the **backend** — the
-firmware only ships raw data and executes commands.
+| Water level | Reads the STM's ADC, converts to `level_cm`, publishes `devices/{id}/water` (throttled). |
+| Risk state | Judged **on the ESP32** from ADC thresholds; sent to the STM (it drives LCD + servos). |
+| Clock | Sends `hour:minute` (SNTP + UTC offset) for the STM 7-segment display. |
+| Heartbeat | Publishes `{rssi, timestamp}` every 30 s. |
+| Commands | Backend command → forces STM to DANGER for a hold window; publishes a best-effort `ok` ACK. |
+| Power | Synthesises a `cutoff` event when it drives DANGER. |
+| Offline | Buffers uplink events in NVS, flushes on reconnect (timestamps kept). |
 
 ## Project layout
 
 ```
 main/                 app_main, config (app_config.h), Kconfig, deps
 components/
-  proto/              MQTT topics + payloads, SPI frame definitions, JSON, CRC16
+  proto/              MQTT topics + payloads, STM link constants, JSON
   wifi_mgr/           Wi-Fi station + reconnect + SNTP + RSSI
   mqtt_link/          MQTT transport (esp-mqtt: subscribe, publish, reconnect)
-  spi_link/           SPI master, DataReady IRQ, TX queue, service task
+  spi_link/           SPI master, 3-byte poll exchange with the STM
   evt_queue/          NVS-backed offline event ring buffer
-  app_core/           orchestration: routing, heartbeat, ACK timeouts
-docs/PROTOCOL.md      authoritative wire spec (backend + STM teams)
+  app_core/           orchestration: state judgement, clock, routing, heartbeat
+docs/PROTOCOL.md      authoritative wire spec (backend + STM)
 ```
 
 ## Build & flash
@@ -64,40 +64,40 @@ idf.py -p PORT flash monitor
 
 ### Configure (menuconfig → WellHouse Configuration)
 
-- **Identity & network:** device ID, MQTT broker URI, MQTT username/password, Wi-Fi
-  SSID/password, SNTP server.
-- **Timing & storage:** heartbeat interval, command ACK timeout, offline queue capacity.
-- **SPI link:** MISO/MOSI/SCLK/CS/DataReady GPIOs and clock. Defaults (ESP32 classic):
-  MISO=19, MOSI=23, SCLK=18, CS=5, DataReady=4, 1 MHz.
+- **Identity & network:** device ID, MQTT broker URI, MQTT username/password, Wi-Fi, SNTP.
+- **Timing & storage:** heartbeat, water-publish throttle, command DANGER hold, UTC offset, queue cap.
+- **Water: ADC mapping & risk thresholds:** ADC→cm calibration and the SAFE/WARNING/ALERT/DANGER
+  ADC thresholds (defaults mirror the STM's `main.c`: 500 / 1200 / 2500).
+- **SPI link:** MISO/MOSI/SCLK/CS GPIOs, clock, poll interval. Defaults (ESP32 classic):
+  MISO=19, MOSI=23, SCLK=18, CS=5, 1 MHz, 100 ms poll.
+
+Wiring: ESP32 SCLK→STM PB13, MOSI→STM PB15, MISO←STM PB14, CS→STM PB12 (NSS).
 
 ### Talking to the backend
 
-The backend's `dev` profile boots with **MQTT disabled** (H2, no broker). To test
-firmware↔backend over MQTT, run the backend with the broker enabled:
+The backend `dev` profile has MQTT **off**. To test over MQTT:
 
 ```bash
 # in the backend repo
 docker compose up -d                                   # postgres + mosquitto
-mvn spring-boot:run -Dspring-boot.run.profiles=prod    # or set WELLHOUSE_MQTT_ENABLED=true
+mvn spring-boot:run -Dspring-boot.run.profiles=prod    # or WELLHOUSE_MQTT_ENABLED=true
 ```
 
-Then point `WELLHOUSE_MQTT_BROKER_URI` at that broker (e.g. `mqtt://<pc-ip>:1883`).
-The backend's dev seed creates `demo-device-01` (pairingCode `123456`) — a handy
-default `WELLHOUSE_DEVICE_ID`. The dev Mosquitto is anonymous, so leave MQTT
-username/password empty.
+Point `WELLHOUSE_MQTT_BROKER_URI` at that broker; the dev seed device is
+`demo-device-01` (anonymous broker, so leave MQTT user/pass empty).
 
-### TLS notes for `mqtts://`
+## Known limitations (3-byte link)
 
-`mqtts://` validates the broker certificate against the ESP-IDF CA bundle
-(`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`, enabled in `sdkconfig.defaults`). For a private
-CA, add it to the bundle. The clock is SNTP-synced before the first connection so
-certificate validity checks pass.
+- **No per-target commands / no confirmed ACK.** A backend command coarsely forces
+  DANGER (STM actuates all servos) and the ACK is best-effort `ok`.
+- **Power events are synthesised**, and STM error reporting is not available.
+- **STM slave timing is fragile** (blocking `HAL_SPI_TransmitReceive` in a slow loop);
+  it should move to DMA/interrupt. Keep the ESP32 poll interval short.
 
-## Not yet included (intentional next steps)
+To lift these, adopt a framed protocol (SOF+CRC+typing, DataReady line, DMA slave) on
+both sides. `git log` has the earlier 32-byte framed implementation for reference.
 
-- **Pairing / deviceToken provisioning** — for an authenticated broker, the token
-  comes from the app's pairing flow (`POST /api/pair`) and would be injected into
-  NVS and used as the MQTT password.
-- **Wi-Fi provisioning** (SoftAP/BLE) — credentials are currently Kconfig values.
-- **Deep sleep** on `control/wakeup` — currently the hint is just forwarded to the STM.
-- **STM firmware** — implement the SPI slave side per `docs/PROTOCOL.md`.
+## Not yet included
+
+- Pairing / deviceToken provisioning, Wi-Fi provisioning (SoftAP/BLE), deep sleep.
+- ADC→cm calibration is a rough linear default — tune to your sensor.

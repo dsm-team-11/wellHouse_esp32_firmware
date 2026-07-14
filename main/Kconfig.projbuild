@@ -50,13 +50,30 @@ menu "WellHouse Configuration"
             range 5000 600000
             default 30000
 
-        config WELLHOUSE_CMD_TIMEOUT_MS
-            int "Command ACK timeout (ms)"
+        config WELLHOUSE_WATER_PUBLISH_MS
+            int "Min interval between water publishes (ms)"
+            range 200 60000
+            default 2000
+            help
+                The STM is polled far more often than this; water is published
+                to the backend at most once per interval.
+
+        config WELLHOUSE_CMD_HOLD_MS
+            int "Command DANGER hold (ms)"
             range 1000 60000
             default 10000
             help
-                If the STM does not report a result within this window, a
-                fail ACK ("timeout") is published to the backend.
+                On a backend actuation command, the ESP32 forces the STM to
+                DANGER for this long so it runs Emergency_Action. (The 3-byte
+                link has no per-target control or real ACK.)
+
+        config WELLHOUSE_UTC_OFFSET_MIN
+            int "Local time offset from UTC (minutes)"
+            range -720 840
+            default 540
+            help
+                Used to build the hour:minute clock sent to the STM 7-segment
+                display. KST (UTC+9) = 540.
 
         config WELLHOUSE_EVENT_QUEUE_CAP
             int "Offline event queue capacity"
@@ -67,7 +84,39 @@ menu "WellHouse Configuration"
                 Oldest events are dropped when full.
     endmenu
 
-    menu "SPI link to STM (ESP32 is master)"
+    menu "Water: ADC mapping & risk thresholds"
+        config WELLHOUSE_WATER_ADC_ZERO
+            int "ADC reading at 0 cm"
+            range 0 4095
+            default 500
+
+        config WELLHOUSE_WATER_ADC_PER_CM
+            int "ADC counts per cm"
+            range 1 4095
+            default 300
+            help
+                level_cm = (adc - zero) / per_cm. Calibrate to your sensor.
+
+        config WELLHOUSE_THR_WARNING
+            int "ADC threshold: WARNING"
+            range 0 4095
+            default 500
+
+        config WELLHOUSE_THR_ALERT
+            int "ADC threshold: ALERT"
+            range 0 4095
+            default 1200
+
+        config WELLHOUSE_THR_DANGER
+            int "ADC threshold: DANGER"
+            range 0 4095
+            default 2500
+            help
+                State byte sent to the STM: >=DANGER -> 3, >=ALERT -> 2,
+                >=WARNING -> 1, else 0. The STM actuates on ALERT/DANGER.
+    endmenu
+
+    menu "SPI link to STM (ESP32 is master, 3-byte exchange)"
         config WELLHOUSE_SPI_MISO
             int "MISO GPIO (STM -> ESP32)"
             default 19
@@ -81,17 +130,21 @@ menu "WellHouse Configuration"
             default 18
 
         config WELLHOUSE_SPI_CS
-            int "CS GPIO"
+            int "CS GPIO (drives the STM's hardware NSS)"
             default 5
-
-        config WELLHOUSE_SPI_DATAREADY
-            int "DataReady GPIO (STM -> ESP32, active high)"
-            default 4
 
         config WELLHOUSE_SPI_CLOCK_HZ
             int "SPI clock (Hz)"
             range 100000 20000000
             default 1000000
+
+        config WELLHOUSE_SPI_POLL_MS
+            int "SPI poll interval (ms)"
+            range 20 2000
+            default 100
+            help
+                How often the ESP32 clocks a 3-byte transaction. Keep it short
+                relative to the STM's loop so exchanges land in its SPI window.
     endmenu
 
 endmenu

@@ -2,13 +2,14 @@
  * proto.h - WellHouse shared protocol definitions.
  *
  * Two wire protocols live here:
- *   1) MQTT      : topic + flat JSON between this firmware and the Spring Boot
- *                  backend (Mosquitto broker). See docs/API.md in the backend.
- *   2) SPI frame : fixed 32-byte frames between this firmware (master) and the
- *                  STM Nucleo (slave).
- *
- * Both SPI peers are little-endian (ESP32 + STM32), so packed structs are
- * exchanged without byte swapping. See docs/PROTOCOL.md for the full spec.
+ *   1) MQTT     : topic + flat JSON between this firmware and the Spring Boot
+ *                 backend (Mosquitto broker). See docs/API.md in the backend.
+ *   2) STM link : a fixed 3-byte SPI exchange with the STM Nucleo (which is the
+ *                 SPI slave). This matches the STM firmware's main.c as-is:
+ *                   ESP32 -> STM : [ state(0..3), hour, minute ]
+ *                   STM -> ESP32 : [ 0xAA, water_adc_hi, water_adc_lo ]
+ *                 There is no CRC or message typing on this link - the STM's
+ *                 format has no room for it. See docs/PROTOCOL.md.
  */
 #pragma once
 
@@ -39,54 +40,19 @@ typedef enum {
     TARGET_UNKNOWN    = 0xFF,
 } cmd_target_t;
 
-/* ------------------------------------------------------------------ */
-/*  1) SPI link protocol  (ESP32 master <-> STM slave)                 */
-/* ------------------------------------------------------------------ */
-#define SPI_FRAME_SOF     0xA5u
-#define SPI_FRAME_SIZE    32
-#define SPI_PAYLOAD_SIZE  (SPI_FRAME_SIZE - 4 /*header*/ - 2 /*crc*/) /* 26 */
-
+/* Risk state byte sent to the STM (matches its SystemState enum). */
 typedef enum {
-    SPI_MSG_NOP        = 0x00, /* idle filler in either direction         */
-    /* STM -> ESP32 */
-    SPI_MSG_WATER      = 0x10, /* water level sample                      */
-    SPI_MSG_POWER      = 0x11, /* breaker/power state change              */
-    SPI_MSG_CMD_RESULT = 0x12, /* result of a command ESP32 sent to STM   */
-    SPI_MSG_ERROR      = 0x13, /* STM-side fault report                   */
-    /* ESP32 -> STM */
-    SPI_MSG_COMMAND    = 0x20, /* actuate target                         */
-    SPI_MSG_TIME_SYNC  = 0x21, /* epoch time push (optional)              */
-    SPI_MSG_WAKEUP     = 0x22, /* weather-driven wake hint (no ACK)       */
-} spi_msg_type_t;
+    RISK_SAFE    = 0,
+    RISK_WARNING = 1,
+    RISK_ALERT   = 2,
+    RISK_DANGER  = 3,
+} risk_state_t;
 
-typedef struct __attribute__((packed)) {
-    uint8_t sof;    /* always SPI_FRAME_SOF                                */
-    uint8_t type;   /* spi_msg_type_t                                     */
-    uint8_t seq;    /* rolling sequence, for debugging/dup detection      */
-    uint8_t flags;  /* reserved (0)                                       */
-    union {
-        struct __attribute__((packed)) { uint16_t level_mm; } water;              /* millimetres */
-        struct __attribute__((packed)) { uint8_t state; uint8_t source; } power;
-        struct __attribute__((packed)) { uint16_t local_cmd_id; uint8_t target; } command;
-        struct __attribute__((packed)) { uint16_t local_cmd_id; uint8_t result; uint8_t detail; } cmd_result;
-        struct __attribute__((packed)) { uint16_t code; char detail[SPI_PAYLOAD_SIZE - 2]; } error;
-        struct __attribute__((packed)) { int64_t epoch_ms; } time_sync;
-        struct __attribute__((packed)) { uint16_t rainfall_mm_h; } wakeup;
-        uint8_t raw[SPI_PAYLOAD_SIZE];
-    } p;
-    uint16_t crc16; /* CRC16-CCITT over bytes [0 .. SPI_FRAME_SIZE-3]     */
-} spi_frame_t;
-
-_Static_assert(sizeof(spi_frame_t) == SPI_FRAME_SIZE, "spi_frame_t must be 32 bytes");
-
-/* CRC16-CCITT (poly 0x1021, init 0xFFFF). */
-uint16_t proto_crc16(const uint8_t *data, size_t len);
-
-/* Stamp SOF and CRC into a frame whose type/payload are already set. */
-void spi_frame_finalize(spi_frame_t *f);
-
-/* True when SOF and CRC both check out. */
-bool spi_frame_valid(const spi_frame_t *f);
+/* ------------------------------------------------------------------ */
+/*  1) STM 3-byte SPI link                                             */
+/* ------------------------------------------------------------------ */
+#define STM_SYNC       0xAAu   /* first byte the STM sends              */
+#define STM_FRAME_LEN  3       /* bytes exchanged each transaction       */
 
 /* ------------------------------------------------------------------ */
 /*  2) MQTT protocol  (firmware <-> backend)                           */

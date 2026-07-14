@@ -5,39 +5,6 @@
 #include <sys/time.h>
 
 /* ------------------------------------------------------------------ */
-/*  CRC + SPI frame helpers                                            */
-/* ------------------------------------------------------------------ */
-uint16_t proto_crc16(const uint8_t *data, size_t len)
-{
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; b++) {
-            if (crc & 0x8000) {
-                crc = (uint16_t)((crc << 1) ^ 0x1021);
-            } else {
-                crc = (uint16_t)(crc << 1);
-            }
-        }
-    }
-    return crc;
-}
-
-void spi_frame_finalize(spi_frame_t *f)
-{
-    f->sof = SPI_FRAME_SOF;
-    f->crc16 = proto_crc16((const uint8_t *)f, SPI_FRAME_SIZE - 2);
-}
-
-bool spi_frame_valid(const spi_frame_t *f)
-{
-    if (f->sof != SPI_FRAME_SOF) {
-        return false;
-    }
-    return f->crc16 == proto_crc16((const uint8_t *)f, SPI_FRAME_SIZE - 2);
-}
-
-/* ------------------------------------------------------------------ */
 /*  Time                                                               */
 /* ------------------------------------------------------------------ */
 int64_t proto_now_ms(void)

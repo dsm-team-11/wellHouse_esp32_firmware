@@ -72,23 +72,30 @@ void app_main(void)
     /* Offline queue first, so early SPI frames can be buffered if MQTT is down. */
     ESP_ERROR_CHECK(evt_queue_init(APP_EVENT_QUEUE_CAP));
 
-    /* SPI link to the STM. */
+    /* SPI link to the STM (3-byte master exchange). */
     spi_link_cfg_t spi_cfg = {
         .host = APP_SPI_HOST,
         .pin_miso = APP_SPI_MISO,
         .pin_mosi = APP_SPI_MOSI,
         .pin_sclk = APP_SPI_SCLK,
         .pin_cs = APP_SPI_CS,
-        .pin_dataready = APP_SPI_DATAREADY,
         .clock_hz = APP_SPI_CLOCK_HZ,
+        .poll_ms = APP_SPI_POLL_MS,
     };
-    ESP_ERROR_CHECK(spi_link_init(&spi_cfg, app_core_on_spi_frame));
+    ESP_ERROR_CHECK(spi_link_init(&spi_cfg, app_core_on_water));
 
-    /* Orchestration (heartbeat, routing, ACK timeouts). */
+    /* Orchestration (state judgement, clock, heartbeat, best-effort ACK). */
     app_core_cfg_t core_cfg = {
         .device_id = APP_DEVICE_ID,
         .heartbeat_ms = APP_HEARTBEAT_MS,
-        .cmd_timeout_ms = APP_CMD_TIMEOUT_MS,
+        .water_publish_ms = APP_WATER_PUBLISH_MS,
+        .cmd_hold_ms = APP_CMD_HOLD_MS,
+        .utc_offset_min = APP_UTC_OFFSET_MIN,
+        .adc_zero = APP_WATER_ADC_ZERO,
+        .adc_per_cm = APP_WATER_ADC_PER_CM,
+        .thr_warning = APP_THR_WARNING,
+        .thr_alert = APP_THR_ALERT,
+        .thr_danger = APP_THR_DANGER,
     };
     ESP_ERROR_CHECK(app_core_init(&core_cfg));
 

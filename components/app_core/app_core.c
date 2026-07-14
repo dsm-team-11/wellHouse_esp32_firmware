@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,28 +22,24 @@ static const char *TAG = "app_core";
 
 #define EVT_FLUSH      (1 << 0)
 #define EVT_HEARTBEAT  (1 << 1)
-#define PENDING_SLOTS  16
 #define QUEUE_LINE_SEP '\n'
 #define FLUSH_BUF_SIZE 512
 #define APP_TASK_STACK 6144
 #define APP_TASK_PRIO  5
 #define MQTT_QOS       1
 
-typedef struct {
-    bool     used;
-    uint16_t local_id;
-    char     cmd_id[40];
-    int64_t  created_ms;
-} pending_t;
-
-static app_core_cfg_t   s_cfg;
-static char             s_device_id[40];
+static app_core_cfg_t    s_cfg;
+static char              s_device_id[40];
 
 static EventGroupHandle_t s_events;
-static SemaphoreHandle_t  s_pending_lock;
-static pending_t          s_pending[PENDING_SLOTS];
-static uint16_t           s_next_id = 1;
-static bool               s_time_pushed;
+static SemaphoreHandle_t  s_lock;
+
+/* Shared state (guarded by s_lock). */
+static uint16_t      s_adc;
+static risk_state_t  s_threshold_state = RISK_SAFE;
+static risk_state_t  s_last_state = RISK_SAFE;
+static int64_t       s_escalate_until;
+static int64_t       s_last_water_pub_ms;
 
 /* ------------------------------------------------------------------ */
 /*  Uplink: publish, or queue "topic\npayload" for later. Frees json.  */
@@ -64,67 +61,89 @@ static void publish_or_queue(const char *topic, char *payload)
     free(payload);
 }
 
-static void publish_ack(const char *cmd_id, cmd_result_t result, const char *detail)
-{
-    char topic[MQTT_TOPIC_MAX];
-    mqtt_topic_ack(topic, sizeof(topic), s_device_id, cmd_id);
-    publish_or_queue(topic, mqtt_payload_ack(result, detail));
-}
-
 /* ------------------------------------------------------------------ */
-/*  Pending command table                                              */
+/*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
-static pending_t *pending_alloc(uint16_t local_id, const char *cmd_id)
+static risk_state_t state_from_adc(uint16_t adc)
 {
-    for (int i = 0; i < PENDING_SLOTS; i++) {
-        if (!s_pending[i].used) {
-            s_pending[i].used = true;
-            s_pending[i].local_id = local_id;
-            strlcpy(s_pending[i].cmd_id, cmd_id, sizeof(s_pending[i].cmd_id));
-            s_pending[i].created_ms = proto_now_ms();
-            return &s_pending[i];
-        }
-    }
-    return NULL;
+    if (adc >= s_cfg.thr_danger)  return RISK_DANGER;
+    if (adc >= s_cfg.thr_alert)   return RISK_ALERT;
+    if (adc >= s_cfg.thr_warning) return RISK_WARNING;
+    return RISK_SAFE;
 }
 
-static bool pending_take(uint16_t local_id, char *cmd_id_out, size_t out_len)
+static double adc_to_cm(uint16_t adc)
 {
-    for (int i = 0; i < PENDING_SLOTS; i++) {
-        if (s_pending[i].used && s_pending[i].local_id == local_id) {
-            strlcpy(cmd_id_out, s_pending[i].cmd_id, out_len);
-            s_pending[i].used = false;
-            return true;
-        }
-    }
-    return false;
+    double cm = (double)((int)adc - s_cfg.adc_zero) / (double)s_cfg.adc_per_cm;
+    return cm < 0 ? 0.0 : cm;
 }
 
-/* Fail-ACK any command the STM hasn't answered within cmd_timeout_ms. */
-static void pending_sweep(void)
+static void local_hm(uint8_t *hour, uint8_t *minute)
+{
+    time_t t = time(NULL) + (time_t)s_cfg.utc_offset_min * 60;
+    struct tm tm_info;
+    gmtime_r(&t, &tm_info);
+    *hour = (uint8_t)tm_info.tm_hour;
+    *minute = (uint8_t)tm_info.tm_min;
+}
+
+/*
+ * Recompute the effective state, push it (+ clock) to the STM, and publish any
+ * derived MQTT events. Publishing is done outside the lock.
+ */
+static void refresh(bool have_new_water, uint16_t adc)
 {
     int64_t now = proto_now_ms();
-    xSemaphoreTake(s_pending_lock, portMAX_DELAY);
-    for (int i = 0; i < PENDING_SLOTS; i++) {
-        if (s_pending[i].used &&
-            (now - s_pending[i].created_ms) > s_cfg.cmd_timeout_ms) {
-            char cmd_id[40];
-            strlcpy(cmd_id, s_pending[i].cmd_id, sizeof(cmd_id));
-            s_pending[i].used = false;
-            xSemaphoreGive(s_pending_lock);
+    uint8_t hour, minute;
+    local_hm(&hour, &minute);
 
-            ESP_LOGW(TAG, "command %s timed out", cmd_id);
-            publish_ack(cmd_id, RESULT_FAIL, "timeout");
+    bool pub_water = false, pub_power = false;
+    double level_cm = 0;
+    risk_state_t st;
 
-            xSemaphoreTake(s_pending_lock, portMAX_DELAY);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (have_new_water) {
+        s_adc = adc;
+        s_threshold_state = state_from_adc(adc);
+        if (now - s_last_water_pub_ms >= s_cfg.water_publish_ms) {
+            s_last_water_pub_ms = now;
+            pub_water = true;
+            level_cm = adc_to_cm(adc);
         }
     }
-    xSemaphoreGive(s_pending_lock);
+    bool escalating = now < s_escalate_until;
+    st = s_threshold_state;
+    if (escalating && st < RISK_DANGER) {
+        st = RISK_DANGER;
+    }
+    if (st == RISK_DANGER && s_last_state != RISK_DANGER) {
+        pub_power = true; /* synthesised: driving DANGER cuts the breaker */
+    }
+    s_last_state = st;
+    xSemaphoreGive(s_lock);
+
+    spi_link_set_downlink((uint8_t)st, hour, minute);
+
+    if (pub_water) {
+        char topic[MQTT_TOPIC_MAX];
+        mqtt_topic_water(topic, sizeof(topic), s_device_id);
+        publish_or_queue(topic, mqtt_payload_water(now, level_cm));
+    }
+    if (pub_power) {
+        char topic[MQTT_TOPIC_MAX];
+        mqtt_topic_power(topic, sizeof(topic), s_device_id);
+        publish_or_queue(topic, mqtt_payload_power(now, POWER_CUTOFF, SRC_AUTO));
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /*  Callbacks                                                          */
 /* ------------------------------------------------------------------ */
+void app_core_on_water(uint16_t water_adc)
+{
+    refresh(true, water_adc);
+}
+
 void app_core_on_mqtt_state(bool connected)
 {
     if (connected) {
@@ -134,90 +153,30 @@ void app_core_on_mqtt_state(bool connected)
 
 void app_core_on_command(const mqtt_command_t *cmd)
 {
-    if (cmd->target == TARGET_UNKNOWN) {
-        ESP_LOGW(TAG, "command %s has unknown target, rejecting", cmd->cmd_id);
-        publish_ack(cmd->cmd_id, RESULT_FAIL, "unknown target");
-        return;
+    const char *detail = "forced";
+    /* Actuation commands escalate the STM to DANGER (it runs Emergency_Action). */
+    if (cmd->target == TARGET_POWER || cmd->target == TARGET_WINDOW ||
+        cmd->target == TARGET_WATER_GATE) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_escalate_until = proto_now_ms() + s_cfg.cmd_hold_ms;
+        xSemaphoreGive(s_lock);
+        ESP_LOGW(TAG, "command %s (target=%d): forcing DANGER (no per-target/ACK over 3-byte link)",
+                 cmd->cmd_id, cmd->target);
+        refresh(false, 0);
+    } else {
+        detail = "noop"; /* WAKEUP / unknown - nothing to actuate here */
     }
 
-    xSemaphoreTake(s_pending_lock, portMAX_DELAY);
-    uint16_t local_id = s_next_id++;
-    if (s_next_id == 0) {
-        s_next_id = 1;
-    }
-    pending_t *p = pending_alloc(local_id, cmd->cmd_id);
-    xSemaphoreGive(s_pending_lock);
-
-    if (!p) {
-        ESP_LOGE(TAG, "pending table full, rejecting %s", cmd->cmd_id);
-        publish_ack(cmd->cmd_id, RESULT_FAIL, "busy");
-        return;
-    }
-
-    ESP_LOGI(TAG, "command %s -> STM (target=%d id=%u)", cmd->cmd_id, cmd->target, local_id);
-    if (spi_link_send_command(local_id, cmd->target) != ESP_OK) {
-        char cmd_id[40];
-        xSemaphoreTake(s_pending_lock, portMAX_DELAY);
-        pending_take(local_id, cmd_id, sizeof(cmd_id));
-        xSemaphoreGive(s_pending_lock);
-        publish_ack(cmd->cmd_id, RESULT_FAIL, "spi-busy");
-    }
+    /* Best-effort ACK: the STM gives no result over this link. */
+    char topic[MQTT_TOPIC_MAX];
+    mqtt_topic_ack(topic, sizeof(topic), s_device_id, cmd->cmd_id);
+    publish_or_queue(topic, mqtt_payload_ack(RESULT_OK, detail));
 }
 
 void app_core_on_wakeup(const mqtt_wakeup_t *wk)
 {
-    ESP_LOGI(TAG, "wakeup: region=%s rainfall=%.1fmm/h", wk->region, wk->rainfall_mm_h);
-    uint16_t rain = (wk->rainfall_mm_h > 0) ? (uint16_t)(wk->rainfall_mm_h + 0.5) : 0;
-    spi_link_send_wakeup(rain);
-}
-
-void app_core_on_spi_frame(const spi_frame_t *f)
-{
-    int64_t now = proto_now_ms();
-    char topic[MQTT_TOPIC_MAX];
-
-    switch (f->type) {
-    case SPI_MSG_WATER:
-        mqtt_topic_water(topic, sizeof(topic), s_device_id);
-        publish_or_queue(topic, mqtt_payload_water(now, f->p.water.level_mm / 10.0));
-        break;
-
-    case SPI_MSG_POWER:
-        mqtt_topic_power(topic, sizeof(topic), s_device_id);
-        publish_or_queue(topic, mqtt_payload_power(now,
-                                                   (power_state_t)f->p.power.state,
-                                                   (power_source_t)f->p.power.source));
-        break;
-
-    case SPI_MSG_CMD_RESULT: {
-        char cmd_id[40] = {0};
-        xSemaphoreTake(s_pending_lock, portMAX_DELAY);
-        bool found = pending_take(f->p.cmd_result.local_cmd_id, cmd_id, sizeof(cmd_id));
-        xSemaphoreGive(s_pending_lock);
-        if (!found) {
-            ESP_LOGW(TAG, "cmd result for unknown id %u", f->p.cmd_result.local_cmd_id);
-            break;
-        }
-        char detail[24];
-        snprintf(detail, sizeof(detail), "d=%u", (unsigned)f->p.cmd_result.detail);
-        cmd_result_t r = (f->p.cmd_result.result == RESULT_OK) ? RESULT_OK : RESULT_FAIL;
-        publish_ack(cmd_id, r, detail);
-        break;
-    }
-
-    case SPI_MSG_ERROR: {
-        /* The backend has no error topic; log locally. */
-        char detail[SPI_PAYLOAD_SIZE];
-        memcpy(detail, f->p.error.detail, sizeof(f->p.error.detail));
-        detail[sizeof(f->p.error.detail)] = '\0';
-        ESP_LOGE(TAG, "STM error code=%u detail=%s", (unsigned)f->p.error.code, detail);
-        break;
-    }
-
-    default:
-        ESP_LOGW(TAG, "unhandled SPI frame type 0x%02x", f->type);
-        break;
-    }
+    ESP_LOGI(TAG, "wakeup: region=%s rainfall=%.1fmm/h (no STM channel, logged only)",
+             wk->region, wk->rainfall_mm_h);
 }
 
 /* ------------------------------------------------------------------ */
@@ -282,13 +241,8 @@ static void app_task(void *arg)
             send_heartbeat();
         }
 
-        /* Runs on the ~1s idle tick too. */
-        pending_sweep();
-
-        if (!s_time_pushed && wifi_mgr_time_synced()) {
-            spi_link_send_time_sync(proto_now_ms());
-            s_time_pushed = true;
-        }
+        /* ~1s tick: advance the STM clock and expire command escalation. */
+        refresh(false, 0);
     }
 }
 
@@ -298,8 +252,8 @@ int app_core_init(const app_core_cfg_t *cfg)
     strlcpy(s_device_id, cfg->device_id, sizeof(s_device_id));
 
     s_events = xEventGroupCreate();
-    s_pending_lock = xSemaphoreCreateMutex();
-    if (!s_events || !s_pending_lock) {
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_events || !s_lock) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -315,6 +269,8 @@ int app_core_init(const app_core_cfg_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "app_core up (device=%s, hb=%dms)", s_device_id, s_cfg.heartbeat_ms);
+    ESP_LOGI(TAG, "app_core up (device=%s, hb=%dms, thresholds=%d/%d/%d)",
+             s_device_id, s_cfg.heartbeat_ms,
+             s_cfg.thr_warning, s_cfg.thr_alert, s_cfg.thr_danger);
     return ESP_OK;
 }
