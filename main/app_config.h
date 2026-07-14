@@ -1,0 +1,83 @@
+/*
+ * app_config.h - central configuration.
+ *
+ * Values come from `idf.py menuconfig` -> "WellHouse Configuration" (see
+ * Kconfig.projbuild). The #ifndef fallbacks keep the tree building and editors
+ * happy before menuconfig has been run.
+ */
+#pragma once
+
+#include "sdkconfig.h"
+#include "driver/spi_master.h"
+
+#define APP_FW_VERSION "1.0.0"
+
+/* ---- Identity / network ---- */
+#ifndef CONFIG_WELLHOUSE_DEVICE_ID
+#define CONFIG_WELLHOUSE_DEVICE_ID "wh-dev-0001"
+#endif
+#ifndef CONFIG_WELLHOUSE_DEVICE_TOKEN
+#define CONFIG_WELLHOUSE_DEVICE_TOKEN "changeme-device-token"
+#endif
+#ifndef CONFIG_WELLHOUSE_GATEWAY_URI
+#define CONFIG_WELLHOUSE_GATEWAY_URI "wss://gateway.example.com/ws"
+#endif
+#ifndef CONFIG_WELLHOUSE_WIFI_SSID
+#define CONFIG_WELLHOUSE_WIFI_SSID "your-ssid"
+#endif
+#ifndef CONFIG_WELLHOUSE_WIFI_PASSWORD
+#define CONFIG_WELLHOUSE_WIFI_PASSWORD "your-password"
+#endif
+#ifndef CONFIG_WELLHOUSE_SNTP_SERVER
+#define CONFIG_WELLHOUSE_SNTP_SERVER "pool.ntp.org"
+#endif
+
+#define APP_DEVICE_ID     CONFIG_WELLHOUSE_DEVICE_ID
+#define APP_DEVICE_TOKEN  CONFIG_WELLHOUSE_DEVICE_TOKEN
+#define APP_GATEWAY_URI   CONFIG_WELLHOUSE_GATEWAY_URI
+#define APP_WIFI_SSID     CONFIG_WELLHOUSE_WIFI_SSID
+#define APP_WIFI_PASSWORD CONFIG_WELLHOUSE_WIFI_PASSWORD
+#define APP_SNTP_SERVER   CONFIG_WELLHOUSE_SNTP_SERVER
+
+/* ---- Timing / storage ---- */
+#ifndef CONFIG_WELLHOUSE_HEARTBEAT_MS
+#define CONFIG_WELLHOUSE_HEARTBEAT_MS 30000
+#endif
+#ifndef CONFIG_WELLHOUSE_CMD_TIMEOUT_MS
+#define CONFIG_WELLHOUSE_CMD_TIMEOUT_MS 10000
+#endif
+#ifndef CONFIG_WELLHOUSE_EVENT_QUEUE_CAP
+#define CONFIG_WELLHOUSE_EVENT_QUEUE_CAP 64
+#endif
+
+#define APP_HEARTBEAT_MS    CONFIG_WELLHOUSE_HEARTBEAT_MS
+#define APP_CMD_TIMEOUT_MS  CONFIG_WELLHOUSE_CMD_TIMEOUT_MS
+#define APP_EVENT_QUEUE_CAP CONFIG_WELLHOUSE_EVENT_QUEUE_CAP
+
+/* ---- SPI link to STM (ESP32 = master) ---- */
+#ifndef CONFIG_WELLHOUSE_SPI_MISO
+#define CONFIG_WELLHOUSE_SPI_MISO 19
+#endif
+#ifndef CONFIG_WELLHOUSE_SPI_MOSI
+#define CONFIG_WELLHOUSE_SPI_MOSI 23
+#endif
+#ifndef CONFIG_WELLHOUSE_SPI_SCLK
+#define CONFIG_WELLHOUSE_SPI_SCLK 18
+#endif
+#ifndef CONFIG_WELLHOUSE_SPI_CS
+#define CONFIG_WELLHOUSE_SPI_CS 5
+#endif
+#ifndef CONFIG_WELLHOUSE_SPI_DATAREADY
+#define CONFIG_WELLHOUSE_SPI_DATAREADY 4
+#endif
+#ifndef CONFIG_WELLHOUSE_SPI_CLOCK_HZ
+#define CONFIG_WELLHOUSE_SPI_CLOCK_HZ 1000000
+#endif
+
+#define APP_SPI_HOST       SPI2_HOST
+#define APP_SPI_MISO       CONFIG_WELLHOUSE_SPI_MISO
+#define APP_SPI_MOSI       CONFIG_WELLHOUSE_SPI_MOSI
+#define APP_SPI_SCLK       CONFIG_WELLHOUSE_SPI_SCLK
+#define APP_SPI_CS         CONFIG_WELLHOUSE_SPI_CS
+#define APP_SPI_DATAREADY  CONFIG_WELLHOUSE_SPI_DATAREADY
+#define APP_SPI_CLOCK_HZ   CONFIG_WELLHOUSE_SPI_CLOCK_HZ

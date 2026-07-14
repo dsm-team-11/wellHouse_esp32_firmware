@@ -1,2 +1,14 @@
-CONFIG_BLINK_LED_GPIO=y
-CONFIG_BLINK_GPIO=8
+# WellHouse firmware defaults (applied on a fresh build; run menuconfig to tweak)
+
+# Bigger main task stack: app_main brings up several subsystems + TLS.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# TLS: validate wss:// gateway certs against the bundled CA store.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# esp_websocket_client transport over TLS.
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+
+# Give FreeRTOS 1 kHz tick for tighter SPI/command timing.
+CONFIG_FREERTOS_HZ=1000

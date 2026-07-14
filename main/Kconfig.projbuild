@@ -1,49 +1,89 @@
-menu "Example Configuration"
+menu "WellHouse Configuration"
 
-    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
+    menu "Identity & network"
+        config WELLHOUSE_DEVICE_ID
+            string "Device ID"
+            default "wh-dev-0001"
+            help
+                Unique device identifier. Used as deviceId in every WS message
+                and as the RTDB path segment devices/{deviceId}/...
 
-    choice BLINK_LED
-        prompt "Blink LED type"
-        default BLINK_LED_GPIO
-        help
-            Select the LED type. A normal level controlled LED or an addressable LED strip.
-            The default selection is based on the Espressif DevKit boards.
-            You can change the default selection according to your board.
+        config WELLHOUSE_DEVICE_TOKEN
+            string "Device auth token"
+            default "changeme-device-token"
+            help
+                Secret sent in the WS `hello` message so the gateway can
+                authenticate this device. In production this comes from the
+                pairing flow; for development set it here.
 
-        config BLINK_LED_GPIO
-            bool "GPIO"
-        config BLINK_LED_STRIP
-            bool "LED strip"
-    endchoice
+        config WELLHOUSE_GATEWAY_URI
+            string "Gateway WebSocket URI"
+            default "wss://gateway.example.com/ws"
+            help
+                ws:// or wss:// URI of the WellHouse gateway. wss:// validates
+                the server certificate against the bundled CA store.
 
-    choice BLINK_LED_STRIP_BACKEND
-        depends on BLINK_LED_STRIP
-        prompt "LED strip backend peripheral"
-        default BLINK_LED_STRIP_BACKEND_RMT if SOC_RMT_SUPPORTED
-        default BLINK_LED_STRIP_BACKEND_SPI
-        help
-            Select the backend peripheral to drive the LED strip.
+        config WELLHOUSE_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "your-ssid"
 
-        config BLINK_LED_STRIP_BACKEND_RMT
-            depends on SOC_RMT_SUPPORTED
-            bool "RMT"
-        config BLINK_LED_STRIP_BACKEND_SPI
-            bool "SPI"
-    endchoice
+        config WELLHOUSE_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default "your-password"
 
-    config BLINK_GPIO
-        int "Blink GPIO number"
-        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
-        default 8
-        help
-            GPIO number (IOxx) to blink on and off the LED.
-            Some GPIOs are used for other purposes (flash connections, etc.) and cannot be used to blink.
+        config WELLHOUSE_SNTP_SERVER
+            string "SNTP server"
+            default "pool.ntp.org"
+    endmenu
 
-    config BLINK_PERIOD
-        int "Blink period in ms"
-        range 10 3600000
-        default 1000
-        help
-            Define the blinking period in milliseconds.
+    menu "Timing & storage"
+        config WELLHOUSE_HEARTBEAT_MS
+            int "Heartbeat interval (ms)"
+            range 5000 600000
+            default 30000
+
+        config WELLHOUSE_CMD_TIMEOUT_MS
+            int "Command ACK timeout (ms)"
+            range 1000 60000
+            default 10000
+            help
+                If the STM does not report a result within this window, a
+                fail ACK ("timeout") is sent to the gateway.
+
+        config WELLHOUSE_EVENT_QUEUE_CAP
+            int "Offline event queue capacity"
+            range 8 512
+            default 64
+            help
+                Max number of uplink events buffered in NVS while offline.
+                Oldest events are dropped when full.
+    endmenu
+
+    menu "SPI link to STM (ESP32 is master)"
+        config WELLHOUSE_SPI_MISO
+            int "MISO GPIO (STM -> ESP32)"
+            default 19
+
+        config WELLHOUSE_SPI_MOSI
+            int "MOSI GPIO (ESP32 -> STM)"
+            default 23
+
+        config WELLHOUSE_SPI_SCLK
+            int "SCLK GPIO"
+            default 18
+
+        config WELLHOUSE_SPI_CS
+            int "CS GPIO"
+            default 5
+
+        config WELLHOUSE_SPI_DATAREADY
+            int "DataReady GPIO (STM -> ESP32, active high)"
+            default 4
+
+        config WELLHOUSE_SPI_CLOCK_HZ
+            int "SPI clock (Hz)"
+            range 100000 20000000
+            default 1000000
+    endmenu
 
 endmenu
