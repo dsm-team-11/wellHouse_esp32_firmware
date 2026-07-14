@@ -1,0 +1,15 @@
+{
+  "name": "wellhouse-firmware-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Host-side dev broker + firmware simulator for testing the WellHouse backend <-> ESP32 MQTT contract without hardware.",
+  "type": "module",
+  "scripts": {
+    "broker": "node dev-broker.js",
+    "sim": "node firmware-sim.js"
+  },
+  "dependencies": {
+    "aedes": "^0.51.3",
+    "mqtt": "^5.10.1"
+  }
+}

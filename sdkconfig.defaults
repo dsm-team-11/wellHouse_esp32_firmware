@@ -10,3 +10,13 @@ CONFIG_ESP_TLS_USING_MBEDTLS=y
 
 # Give FreeRTOS 1 kHz tick for tighter SPI/command timing.
 CONFIG_FREERTOS_HZ=1000
+
+# ---- WellHouse identity / network ----
+# DEVICE_ID must match a device the backend knows. The dev seed creates
+# "demo-device-01" (pairingCode 123456), so this default pairs out of the box.
+CONFIG_WELLHOUSE_DEVICE_ID="demo-device-01"
+# Broker + Wi-Fi are site-specific — set them via `idf.py menuconfig`
+# -> "WellHouse Configuration" (secrets stay out of git):
+#   MQTT broker URI : mqtt://<backend-PC-LAN-IP>:1883   (e.g. mqtt://10.162.191.207:1883)
+#   Wi-Fi SSID / password : your network (ESP32 needs 2.4 GHz)
+# The backend must run with MQTT enabled against the same broker — see docs/INTEGRATION.md.
