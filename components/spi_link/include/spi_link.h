@@ -30,11 +30,14 @@ typedef struct {
 /* Bring up the bus, DataReady IRQ, TX queue and service task. */
 int spi_link_init(const spi_link_cfg_t *cfg, spi_frame_cb_t on_frame);
 
-/* Queue a COMMAND frame for the STM. local_cmd_id maps back to a WS cmdId. */
-int spi_link_send_command(uint16_t local_cmd_id, cmd_target_t target, cmd_action_t action);
+/* Queue a COMMAND frame for the STM. local_cmd_id maps back to the MQTT cmdId. */
+int spi_link_send_command(uint16_t local_cmd_id, cmd_target_t target);
 
 /* Push the current epoch time to the STM (optional; call after SNTP sync). */
 int spi_link_send_time_sync(int64_t epoch_ms);
+
+/* Forward a weather-driven wakeup hint to the STM (no ACK expected). */
+int spi_link_send_wakeup(uint16_t rainfall_mm_h);
 
 #ifdef __cplusplus
 }

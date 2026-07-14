@@ -12,19 +12,21 @@
 #include "esp_log.h"
 #include "esp_err.h"
 
-#include "ws_client.h"
+#include "mqtt_link.h"
 #include "spi_link.h"
 #include "evt_queue.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "app_core";
 
-#define EVT_GREET      (1 << 0)
+#define EVT_FLUSH      (1 << 0)
 #define EVT_HEARTBEAT  (1 << 1)
 #define PENDING_SLOTS  16
+#define QUEUE_LINE_SEP '\n'
 #define FLUSH_BUF_SIZE 512
 #define APP_TASK_STACK 6144
 #define APP_TASK_PRIO  5
+#define MQTT_QOS       1
 
 typedef struct {
     bool     used;
@@ -35,8 +37,6 @@ typedef struct {
 
 static app_core_cfg_t   s_cfg;
 static char             s_device_id[40];
-static char             s_token[128];
-static char             s_fw[16];
 
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t  s_pending_lock;
@@ -45,17 +45,30 @@ static uint16_t           s_next_id = 1;
 static bool               s_time_pushed;
 
 /* ------------------------------------------------------------------ */
-/*  Uplink helper: send if connected, otherwise queue. Frees `json`.   */
+/*  Uplink: publish, or queue "topic\npayload" for later. Frees json.  */
 /* ------------------------------------------------------------------ */
-static void uplink_take(char *json)
+static void publish_or_queue(const char *topic, char *payload)
 {
-    if (!json) {
+    if (!payload) {
         return;
     }
-    if (ws_client_send(json) != ESP_OK) {
-        evt_queue_push(json);
+    if (mqtt_link_publish(topic, payload, MQTT_QOS, false) != ESP_OK) {
+        char line[FLUSH_BUF_SIZE];
+        int n = snprintf(line, sizeof(line), "%s%c%s", topic, QUEUE_LINE_SEP, payload);
+        if (n > 0 && n < (int)sizeof(line)) {
+            evt_queue_push(line);
+        } else {
+            ESP_LOGW(TAG, "event too large to queue (%d bytes), dropped", n);
+        }
     }
-    free(json);
+    free(payload);
+}
+
+static void publish_ack(const char *cmd_id, cmd_result_t result, const char *detail)
+{
+    char topic[MQTT_TOPIC_MAX];
+    mqtt_topic_ack(topic, sizeof(topic), s_device_id, cmd_id);
+    publish_or_queue(topic, mqtt_payload_ack(result, detail));
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,7 +114,7 @@ static void pending_sweep(void)
             xSemaphoreGive(s_pending_lock);
 
             ESP_LOGW(TAG, "command %s timed out", cmd_id);
-            uplink_take(ws_build_cmd_ack(s_device_id, now, cmd_id, RESULT_FAIL, "timeout"));
+            publish_ack(cmd_id, RESULT_FAIL, "timeout");
 
             xSemaphoreTake(s_pending_lock, portMAX_DELAY);
         }
@@ -112,15 +125,21 @@ static void pending_sweep(void)
 /* ------------------------------------------------------------------ */
 /*  Callbacks                                                          */
 /* ------------------------------------------------------------------ */
-void app_core_on_ws_state(bool connected)
+void app_core_on_mqtt_state(bool connected)
 {
     if (connected) {
-        xEventGroupSetBits(s_events, EVT_GREET);
+        xEventGroupSetBits(s_events, EVT_FLUSH);
     }
 }
 
-void app_core_on_ws_command(const ws_command_t *cmd)
+void app_core_on_command(const mqtt_command_t *cmd)
 {
+    if (cmd->target == TARGET_UNKNOWN) {
+        ESP_LOGW(TAG, "command %s has unknown target, rejecting", cmd->cmd_id);
+        publish_ack(cmd->cmd_id, RESULT_FAIL, "unknown target");
+        return;
+    }
+
     xSemaphoreTake(s_pending_lock, portMAX_DELAY);
     uint16_t local_id = s_next_id++;
     if (s_next_id == 0) {
@@ -131,35 +150,43 @@ void app_core_on_ws_command(const ws_command_t *cmd)
 
     if (!p) {
         ESP_LOGE(TAG, "pending table full, rejecting %s", cmd->cmd_id);
-        uplink_take(ws_build_cmd_ack(s_device_id, proto_now_ms(), cmd->cmd_id,
-                                     RESULT_FAIL, "busy"));
+        publish_ack(cmd->cmd_id, RESULT_FAIL, "busy");
         return;
     }
 
-    ESP_LOGI(TAG, "command %s -> STM (target=%d action=%d id=%u)",
-             cmd->cmd_id, cmd->target, cmd->action, local_id);
-    if (spi_link_send_command(local_id, cmd->target, cmd->action) != ESP_OK) {
+    ESP_LOGI(TAG, "command %s -> STM (target=%d id=%u)", cmd->cmd_id, cmd->target, local_id);
+    if (spi_link_send_command(local_id, cmd->target) != ESP_OK) {
         char cmd_id[40];
         xSemaphoreTake(s_pending_lock, portMAX_DELAY);
         pending_take(local_id, cmd_id, sizeof(cmd_id));
         xSemaphoreGive(s_pending_lock);
-        uplink_take(ws_build_cmd_ack(s_device_id, proto_now_ms(), cmd->cmd_id,
-                                     RESULT_FAIL, "spi-busy"));
+        publish_ack(cmd->cmd_id, RESULT_FAIL, "spi-busy");
     }
+}
+
+void app_core_on_wakeup(const mqtt_wakeup_t *wk)
+{
+    ESP_LOGI(TAG, "wakeup: region=%s rainfall=%.1fmm/h", wk->region, wk->rainfall_mm_h);
+    uint16_t rain = (wk->rainfall_mm_h > 0) ? (uint16_t)(wk->rainfall_mm_h + 0.5) : 0;
+    spi_link_send_wakeup(rain);
 }
 
 void app_core_on_spi_frame(const spi_frame_t *f)
 {
     int64_t now = proto_now_ms();
+    char topic[MQTT_TOPIC_MAX];
+
     switch (f->type) {
     case SPI_MSG_WATER:
-        uplink_take(ws_build_water(s_device_id, now, f->p.water.level_cm));
+        mqtt_topic_water(topic, sizeof(topic), s_device_id);
+        publish_or_queue(topic, mqtt_payload_water(now, f->p.water.level_mm / 10.0));
         break;
 
     case SPI_MSG_POWER:
-        uplink_take(ws_build_power(s_device_id, now,
-                                   (power_state_t)f->p.power.state,
-                                   (power_source_t)f->p.power.source));
+        mqtt_topic_power(topic, sizeof(topic), s_device_id);
+        publish_or_queue(topic, mqtt_payload_power(now,
+                                                   (power_state_t)f->p.power.state,
+                                                   (power_source_t)f->p.power.source));
         break;
 
     case SPI_MSG_CMD_RESULT: {
@@ -174,15 +201,16 @@ void app_core_on_spi_frame(const spi_frame_t *f)
         char detail[24];
         snprintf(detail, sizeof(detail), "d=%u", (unsigned)f->p.cmd_result.detail);
         cmd_result_t r = (f->p.cmd_result.result == RESULT_OK) ? RESULT_OK : RESULT_FAIL;
-        uplink_take(ws_build_cmd_ack(s_device_id, now, cmd_id, r, detail));
+        publish_ack(cmd_id, r, detail);
         break;
     }
 
     case SPI_MSG_ERROR: {
-        char detail[SPI_PAYLOAD_SIZE]; /* frame field may be unterminated */
+        /* The backend has no error topic; log locally. */
+        char detail[SPI_PAYLOAD_SIZE];
         memcpy(detail, f->p.error.detail, sizeof(f->p.error.detail));
         detail[sizeof(f->p.error.detail)] = '\0';
-        uplink_take(ws_build_error(s_device_id, now, f->p.error.code, detail));
+        ESP_LOGE(TAG, "STM error code=%u detail=%s", (unsigned)f->p.error.code, detail);
         break;
     }
 
@@ -203,30 +231,33 @@ static void heartbeat_timer_cb(void *arg)
 
 static void send_heartbeat(void)
 {
-    if (!ws_client_connected()) {
+    if (!mqtt_link_connected()) {
         return; /* heartbeats are liveness-only; never queued */
     }
-    char *json = ws_build_heartbeat(s_device_id, proto_now_ms(), wifi_mgr_rssi());
-    if (json) {
-        ws_client_send(json);
-        free(json);
+    char topic[MQTT_TOPIC_MAX];
+    mqtt_topic_heartbeat(topic, sizeof(topic), s_device_id);
+    char *payload = mqtt_payload_heartbeat(proto_now_ms(), wifi_mgr_rssi());
+    if (payload) {
+        mqtt_link_publish(topic, payload, MQTT_QOS, false);
+        free(payload);
     }
 }
 
-static void greet_and_flush(void)
+static void flush_queue(void)
 {
-    /* hello must be the first frame the gateway sees on this socket. */
-    char *hello = ws_build_hello(s_device_id, s_token, s_fw);
-    if (hello) {
-        ws_client_send(hello);
-        free(hello);
-    }
-
     char buf[FLUSH_BUF_SIZE];
     size_t drained = 0;
     while (evt_queue_peek_oldest(buf, sizeof(buf)) == ESP_OK) {
-        if (ws_client_send(buf) != ESP_OK) {
-            break; /* link dropped mid-flush; try again next connect */
+        char *sep = strchr(buf, QUEUE_LINE_SEP);
+        if (!sep) {
+            evt_queue_pop_oldest(); /* corrupt entry, discard */
+            continue;
+        }
+        *sep = '\0';
+        const char *topic = buf;
+        const char *payload = sep + 1;
+        if (mqtt_link_publish(topic, payload, MQTT_QOS, false) != ESP_OK) {
+            break; /* link dropped mid-flush; retry next connect */
         }
         evt_queue_pop_oldest();
         drained++;
@@ -241,11 +272,11 @@ static void app_task(void *arg)
     (void)arg;
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(
-            s_events, EVT_GREET | EVT_HEARTBEAT,
+            s_events, EVT_FLUSH | EVT_HEARTBEAT,
             pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
 
-        if (bits & EVT_GREET) {
-            greet_and_flush();
+        if (bits & EVT_FLUSH) {
+            flush_queue();
         }
         if (bits & EVT_HEARTBEAT) {
             send_heartbeat();
@@ -265,8 +296,6 @@ int app_core_init(const app_core_cfg_t *cfg)
 {
     s_cfg = *cfg;
     strlcpy(s_device_id, cfg->device_id, sizeof(s_device_id));
-    strlcpy(s_token, cfg->token, sizeof(s_token));
-    strlcpy(s_fw, cfg->fw_version, sizeof(s_fw));
 
     s_events = xEventGroupCreate();
     s_pending_lock = xSemaphoreCreateMutex();

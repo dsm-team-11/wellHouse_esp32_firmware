@@ -1,6 +1,7 @@
 #include "proto.h"
 
 #include <string.h>
+#include <stdio.h>
 #include <sys/time.h>
 
 /* ------------------------------------------------------------------ */
@@ -47,131 +48,131 @@ int64_t proto_now_ms(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  WS envelope builders                                               */
+/*  MQTT topics                                                        */
+/* ------------------------------------------------------------------ */
+void mqtt_topic_water(char *out, size_t n, const char *id)     { snprintf(out, n, "devices/%s/water", id); }
+void mqtt_topic_heartbeat(char *out, size_t n, const char *id) { snprintf(out, n, "devices/%s/heartbeat", id); }
+void mqtt_topic_power(char *out, size_t n, const char *id)     { snprintf(out, n, "devices/%s/power", id); }
+void mqtt_topic_ack(char *out, size_t n, const char *id, const char *cmd_id)
+{
+    snprintf(out, n, "devices/%s/commands/%s/ack", id, cmd_id);
+}
+void mqtt_topic_sub_commands(char *out, size_t n, const char *id) { snprintf(out, n, "devices/%s/commands", id); }
+void mqtt_topic_sub_wakeup(char *out, size_t n, const char *id)   { snprintf(out, n, "devices/%s/control/wakeup", id); }
+
+/* ------------------------------------------------------------------ */
+/*  MQTT payload builders                                              */
 /* ------------------------------------------------------------------ */
 static const char *power_state_str(power_state_t s) { return s == POWER_CUTOFF ? "cutoff" : "on"; }
 static const char *power_src_str(power_source_t s)   { return s == SRC_MANUAL ? "manual" : "auto"; }
 static const char *result_str(cmd_result_t r)        { return r == RESULT_FAIL ? "fail" : "ok"; }
 
-/*
- * Build "{v,t,deviceId,ts,d:{...}}". Takes ownership of `data` (freed on error,
- * attached on success). Returns malloc'd string or NULL.
- */
-static char *envelope(const char *type, const char *device_id, int64_t ts, cJSON *data)
+static char *print_and_free(cJSON *d)
 {
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        if (data) cJSON_Delete(data);
+    if (!d) {
         return NULL;
     }
-    cJSON_AddNumberToObject(root, "v", PROTO_VERSION);
-    cJSON_AddStringToObject(root, "t", type);
-    cJSON_AddStringToObject(root, "deviceId", device_id);
-    cJSON_AddNumberToObject(root, "ts", (double)ts);
-    if (data) {
-        cJSON_AddItemToObject(root, "d", data);
-    }
-    char *out = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    char *out = cJSON_PrintUnformatted(d);
+    cJSON_Delete(d);
     return out;
 }
 
-char *ws_build_hello(const char *device_id, const char *token, const char *fw)
-{
-    cJSON *d = cJSON_CreateObject();
-    if (!d) return NULL;
-    cJSON_AddStringToObject(d, "token", token ? token : "");
-    cJSON_AddStringToObject(d, "fw", fw ? fw : "");
-    return envelope("hello", device_id, proto_now_ms(), d);
-}
-
-char *ws_build_heartbeat(const char *device_id, int64_t ts_ms, int rssi)
-{
-    cJSON *d = cJSON_CreateObject();
-    if (!d) return NULL;
-    cJSON_AddNumberToObject(d, "rssi", rssi);
-    return envelope("heartbeat", device_id, ts_ms, d);
-}
-
-char *ws_build_water(const char *device_id, int64_t ts_ms, int level_cm)
+char *mqtt_payload_water(int64_t ts_ms, double level_cm)
 {
     cJSON *d = cJSON_CreateObject();
     if (!d) return NULL;
     cJSON_AddNumberToObject(d, "level_cm", level_cm);
-    return envelope("water", device_id, ts_ms, d);
+    cJSON_AddNumberToObject(d, "timestamp", (double)ts_ms);
+    return print_and_free(d);
 }
 
-char *ws_build_power(const char *device_id, int64_t ts_ms, power_state_t st, power_source_t src)
+char *mqtt_payload_heartbeat(int64_t ts_ms, int rssi)
+{
+    cJSON *d = cJSON_CreateObject();
+    if (!d) return NULL;
+    cJSON_AddNumberToObject(d, "rssi", rssi);
+    cJSON_AddNumberToObject(d, "timestamp", (double)ts_ms);
+    return print_and_free(d);
+}
+
+char *mqtt_payload_power(int64_t ts_ms, power_state_t st, power_source_t src)
 {
     cJSON *d = cJSON_CreateObject();
     if (!d) return NULL;
     cJSON_AddStringToObject(d, "powerState", power_state_str(st));
     cJSON_AddStringToObject(d, "source", power_src_str(src));
-    return envelope("power", device_id, ts_ms, d);
+    cJSON_AddNumberToObject(d, "timestamp", (double)ts_ms);
+    return print_and_free(d);
 }
 
-char *ws_build_cmd_ack(const char *device_id, int64_t ts_ms, const char *cmd_id,
-                       cmd_result_t result, const char *detail)
+char *mqtt_payload_ack(cmd_result_t result, const char *detail)
 {
     cJSON *d = cJSON_CreateObject();
     if (!d) return NULL;
-    cJSON_AddStringToObject(d, "cmdId", cmd_id ? cmd_id : "");
     cJSON_AddStringToObject(d, "result", result_str(result));
     cJSON_AddStringToObject(d, "detail", detail ? detail : "");
-    return envelope("cmdAck", device_id, ts_ms, d);
+    return print_and_free(d);
 }
 
-char *ws_build_error(const char *device_id, int64_t ts_ms, int code, const char *detail)
+/* ------------------------------------------------------------------ */
+/*  MQTT parsers                                                       */
+/* ------------------------------------------------------------------ */
+static cmd_target_t target_from_str(const char *s)
 {
-    cJSON *d = cJSON_CreateObject();
-    if (!d) return NULL;
-    cJSON_AddNumberToObject(d, "code", code);
-    cJSON_AddStringToObject(d, "detail", detail ? detail : "");
-    return envelope("error", device_id, ts_ms, d);
+    if (!s) return TARGET_UNKNOWN;
+    if (strcmp(s, "POWER") == 0)      return TARGET_POWER;
+    if (strcmp(s, "WINDOW") == 0)     return TARGET_WINDOW;
+    if (strcmp(s, "WATER_GATE") == 0) return TARGET_WATER_GATE;
+    if (strcmp(s, "WAKEUP") == 0)     return TARGET_WAKEUP;
+    return TARGET_UNKNOWN;
 }
 
-/* ------------------------------------------------------------------ */
-/*  WS downlink parser                                                 */
-/* ------------------------------------------------------------------ */
-ws_msg_type_t ws_parse(const char *json, size_t len, ws_command_t *out)
+bool mqtt_parse_command(const char *json, size_t len, mqtt_command_t *out)
 {
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) {
-        return WS_MSG_UNKNOWN;
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->target = TARGET_UNKNOWN;
+
+    const cJSON *cid = cJSON_GetObjectItemCaseSensitive(root, "cmdId");
+    if (cJSON_IsString(cid) && cid->valuestring) {
+        strlcpy(out->cmd_id, cid->valuestring, sizeof(out->cmd_id));
+    }
+    const cJSON *tg = cJSON_GetObjectItemCaseSensitive(root, "target");
+    out->target = target_from_str(cJSON_IsString(tg) ? tg->valuestring : NULL);
+    const cJSON *ts = cJSON_GetObjectItemCaseSensitive(root, "ts");
+    if (cJSON_IsNumber(ts)) {
+        out->ts = (int64_t)ts->valuedouble;
     }
 
-    ws_msg_type_t type = WS_MSG_UNKNOWN;
-    const cJSON *t = cJSON_GetObjectItemCaseSensitive(root, "t");
-    if (cJSON_IsString(t) && t->valuestring) {
-        if (strcmp(t->valuestring, "command") == 0)      type = WS_DN_COMMAND;
-        else if (strcmp(t->valuestring, "welcome") == 0) type = WS_DN_WELCOME;
-        else if (strcmp(t->valuestring, "ping") == 0)    type = WS_DN_PING;
-    }
+    bool ok = out->cmd_id[0] != '\0';
+    cJSON_Delete(root);
+    return ok;
+}
 
-    if (type == WS_DN_COMMAND && out) {
-        memset(out, 0, sizeof(*out));
-        out->type = type;
-        const cJSON *d = cJSON_GetObjectItemCaseSensitive(root, "d");
-        if (cJSON_IsObject(d)) {
-            const cJSON *cid = cJSON_GetObjectItemCaseSensitive(d, "cmdId");
-            if (cJSON_IsString(cid) && cid->valuestring) {
-                strlcpy(out->cmd_id, cid->valuestring, sizeof(out->cmd_id));
-            }
-            const cJSON *tg = cJSON_GetObjectItemCaseSensitive(d, "target");
-            out->target = (cJSON_IsString(tg) && tg->valuestring &&
-                           strcmp(tg->valuestring, "window") == 0)
-                              ? TARGET_WINDOW : TARGET_POWER;
-            const cJSON *ac = cJSON_GetObjectItemCaseSensitive(d, "action");
-            out->action = (cJSON_IsString(ac) && ac->valuestring &&
-                           strcmp(ac->valuestring, "restore") == 0)
-                              ? ACTION_RESTORE : ACTION_CUTOFF;
-            const cJSON *ts = cJSON_GetObjectItemCaseSensitive(d, "ts");
-            if (cJSON_IsNumber(ts)) {
-                out->ts = (int64_t)ts->valuedouble;
-            }
-        }
+bool mqtt_parse_wakeup(const char *json, size_t len, mqtt_wakeup_t *out)
+{
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (!root) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+
+    const cJSON *rain = cJSON_GetObjectItemCaseSensitive(root, "rainfall_mm_h");
+    if (cJSON_IsNumber(rain)) {
+        out->rainfall_mm_h = rain->valuedouble;
+    }
+    const cJSON *region = cJSON_GetObjectItemCaseSensitive(root, "region");
+    if (cJSON_IsString(region) && region->valuestring) {
+        strlcpy(out->region, region->valuestring, sizeof(out->region));
+    }
+    const cJSON *ts = cJSON_GetObjectItemCaseSensitive(root, "timestamp");
+    if (cJSON_IsNumber(ts)) {
+        out->ts = (int64_t)ts->valuedouble;
     }
 
     cJSON_Delete(root);
-    return type;
+    return true;
 }

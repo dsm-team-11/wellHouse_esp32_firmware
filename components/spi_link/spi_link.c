@@ -160,7 +160,17 @@ int spi_link_init(const spi_link_cfg_t *cfg, spi_frame_cb_t on_frame)
     return ESP_OK;
 }
 
-int spi_link_send_command(uint16_t local_cmd_id, cmd_target_t target, cmd_action_t action)
+static int enqueue_tx(const spi_frame_t *f)
+{
+    if (xQueueSend(s_txq, f, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "TX queue full, dropping frame type 0x%02x", f->type);
+        return ESP_FAIL;
+    }
+    xSemaphoreGive(s_wake);
+    return ESP_OK;
+}
+
+int spi_link_send_command(uint16_t local_cmd_id, cmd_target_t target)
 {
     spi_frame_t f;
     memset(&f, 0, sizeof(f));
@@ -168,15 +178,19 @@ int spi_link_send_command(uint16_t local_cmd_id, cmd_target_t target, cmd_action
     f.seq = s_seq++;
     f.p.command.local_cmd_id = local_cmd_id;
     f.p.command.target = (uint8_t)target;
-    f.p.command.action = (uint8_t)action;
     spi_frame_finalize(&f);
+    return enqueue_tx(&f);
+}
 
-    if (xQueueSend(s_txq, &f, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGE(TAG, "TX queue full, dropping command %u", local_cmd_id);
-        return ESP_FAIL;
-    }
-    xSemaphoreGive(s_wake);
-    return ESP_OK;
+int spi_link_send_wakeup(uint16_t rainfall_mm_h)
+{
+    spi_frame_t f;
+    memset(&f, 0, sizeof(f));
+    f.type = SPI_MSG_WAKEUP;
+    f.seq = s_seq++;
+    f.p.wakeup.rainfall_mm_h = rainfall_mm_h;
+    spi_frame_finalize(&f);
+    return enqueue_tx(&f);
 }
 
 int spi_link_send_time_sync(int64_t epoch_ms)
@@ -187,10 +201,5 @@ int spi_link_send_time_sync(int64_t epoch_ms)
     f.seq = s_seq++;
     f.p.time_sync.epoch_ms = epoch_ms;
     spi_frame_finalize(&f);
-
-    if (xQueueSend(s_txq, &f, pdMS_TO_TICKS(100)) != pdTRUE) {
-        return ESP_FAIL;
-    }
-    xSemaphoreGive(s_wake);
-    return ESP_OK;
+    return enqueue_tx(&f);
 }

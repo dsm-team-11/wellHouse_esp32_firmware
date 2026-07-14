@@ -3,25 +3,33 @@ menu "WellHouse Configuration"
     menu "Identity & network"
         config WELLHOUSE_DEVICE_ID
             string "Device ID"
-            default "wh-dev-0001"
+            default "demo-device-01"
             help
-                Unique device identifier. Used as deviceId in every WS message
-                and as the RTDB path segment devices/{deviceId}/...
+                Unique device identifier. Used as the MQTT client id and as the
+                topic segment devices/{deviceId}/... The backend dev seed creates
+                "demo-device-01" (pairingCode 123456).
 
-        config WELLHOUSE_DEVICE_TOKEN
-            string "Device auth token"
-            default "changeme-device-token"
+        config WELLHOUSE_MQTT_BROKER_URI
+            string "MQTT broker URI"
+            default "mqtt://192.168.0.10:1883"
             help
-                Secret sent in the WS `hello` message so the gateway can
-                authenticate this device. In production this comes from the
-                pairing flow; for development set it here.
+                mqtt://host:1883 (plain) or mqtts://host:8883 (TLS, validated
+                against the bundled CA store). Point this at the Mosquitto broker
+                the backend uses.
 
-        config WELLHOUSE_GATEWAY_URI
-            string "Gateway WebSocket URI"
-            default "wss://gateway.example.com/ws"
+        config WELLHOUSE_MQTT_USERNAME
+            string "MQTT username (optional)"
+            default ""
             help
-                ws:// or wss:// URI of the WellHouse gateway. wss:// validates
-                the server certificate against the bundled CA store.
+                Leave empty for the anonymous dev broker. For an authenticated
+                broker, convention is username = deviceId.
+
+        config WELLHOUSE_MQTT_PASSWORD
+            string "MQTT password (optional)"
+            default ""
+            help
+                Leave empty for the anonymous dev broker. For an authenticated
+                broker, use the deviceToken issued by the pairing flow.
 
         config WELLHOUSE_WIFI_SSID
             string "Wi-Fi SSID"
@@ -48,7 +56,7 @@ menu "WellHouse Configuration"
             default 10000
             help
                 If the STM does not report a result within this window, a
-                fail ACK ("timeout") is sent to the gateway.
+                fail ACK ("timeout") is published to the backend.
 
         config WELLHOUSE_EVENT_QUEUE_CAP
             int "Offline event queue capacity"

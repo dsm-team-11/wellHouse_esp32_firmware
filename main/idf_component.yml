@@ -1,3 +1,3 @@
 dependencies:
   idf: ">=5.3"
-  espressif/esp_websocket_client: "^1.2.0"
+  # esp-mqtt (the `mqtt` component) is built into ESP-IDF - no managed dep needed.
